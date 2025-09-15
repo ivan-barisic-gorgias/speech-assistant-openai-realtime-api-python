@@ -1,3 +1,4 @@
+from collections import defaultdict
 import os
 import json
 import base64
@@ -16,10 +17,7 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
 SYSTEM_MESSAGE = (
-    "You are a helpful and bubbly AI assistant who loves to chat about "
-    "anything the user is interested in and is prepared to offer them facts. "
-    "You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. "
-    "Always stay positive, but work in a joke when appropriate."
+    "You are a support agent for an ecommerce company. Speak calmly and professionally. Confirm customer's name and order details before providing any information."
 )
 VOICE = 'alloy'
 LOG_EVENT_TYPES = [
@@ -142,6 +140,43 @@ async def handle_media_stream(websocket: WebSocket):
                         if last_assistant_item:
                             print(f"Interrupting response with id: {last_assistant_item}")
                             await handle_speech_started_event()
+                    
+                    # ---- TOOL CALL HANDLING ----
+                    # a) arguments streaming
+                    if response.get("type") == "response.function_call_arguments.delta":
+                        call_id = response["call_id"]
+                        arg_buffers[call_id].append(response.get("delta", ""))
+                        continue
+
+                    # b) arguments done -> we have full payload and the tool name
+                    if response.get("type") == "response.function_call_arguments.done":
+                        call_id = response["call_id"]
+                        tool_name = response["name"]
+                        full_args = "".join(arg_buffers.pop(call_id, []))  # JSON string
+
+                        try:
+                            args = json.loads(full_args) if full_args else {}
+                        except json.JSONDecodeError:
+                            args = {"_raw": full_args}
+
+                        # run your handler (HTTP/RAG/etc.)
+                        result = await route_tool_call(tool_name, args)
+
+                        # c) send tool output back to the model (continue the response)
+                        tool_output_msg = {
+                            "type": "response.create",
+                            "response": {
+                                "input": [{
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": json.dumps(result)   # must be a string
+                                }]
+                            }
+                        }
+                        await openai_ws.send(json.dumps(tool_output_msg))
+                        continue
+                    # ---- END TOOL CALL HANDLING ----
+
             except Exception as e:
                 print(f"Error in send_to_twilio: {e}")
 
@@ -217,7 +252,7 @@ async def initialize_session(openai_ws):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},
-                    "turn_detection": {"type": "server_vad"}
+                    "turn_detection": { "type": "semantic_vad", "create_response": True }
                 },
                 "output": {
                     "format": {"type": "audio/pcmu"},
@@ -225,6 +260,22 @@ async def initialize_session(openai_ws):
                 }
             },
             "instructions": SYSTEM_MESSAGE,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_kb_snippets",
+                    "description": "Return short knowledge-base snippets for a company that answer a question.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "company_id": {"type": "string", "description": "Tenant/company key"},
+                            "question": {"type": "string", "description": "Natural language question"}
+                        },
+                        "required": ["company_id", "question"],
+                        "additionalProperties": False
+                    }
+                }
+            ],
         }
     }
     print('Sending session update:', json.dumps(session_update))
@@ -232,6 +283,21 @@ async def initialize_session(openai_ws):
 
     # Uncomment the next line to have the AI speak first
     # await send_initial_conversation_item(openai_ws)
+
+
+arg_buffers = defaultdict(list)
+
+async def route_tool_call(name: str, args: dict):
+    # TODO: replace this with your real HTTP/RAG calls
+    if name == "get_kb_snippets":
+        # Example stub result – keep outputs concise
+        return {
+            "snippets": [
+                "Refunds are processed within 5–7 business days.",
+                "Support hours: 9–5 CET, Mon–Fri."
+            ]
+        }
+    return {"error": f"unknown tool: {name}"}
 
 if __name__ == "__main__":
     import uvicorn
