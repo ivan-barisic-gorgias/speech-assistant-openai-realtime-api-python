@@ -9,16 +9,15 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from dotenv import load_dotenv
+from agent_config import SYSTEM_MESSAGE, TOOLS
+from function_handlers import handle_function_call
 
 load_dotenv()
 
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
-TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
-SYSTEM_MESSAGE = (
-    "You are a support agent for an ecommerce company. Speak calmly and professionally. Confirm customer's name and order details before providing any information."
-)
+TEMPERATURE = float(os.getenv('TEMPERATURE', 0.7))
 VOICE = 'alloy'
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
@@ -43,12 +42,7 @@ async def handle_incoming_call(request: Request):
     response = VoiceResponse()
     # <Say> punctuation to improve text-to-speech flow
     response.say(
-        "Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API",
-        voice="Google.en-US-Chirp3-HD-Aoede"
-    )
-    response.pause(length=1)
-    response.say(   
-        "O.K. you can start talking!",
+        "You are connected to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API",
         voice="Google.en-US-Chirp3-HD-Aoede"
     )
     host = request.url.hostname
@@ -162,18 +156,39 @@ async def handle_media_stream(websocket: WebSocket):
                         # run your handler (HTTP/RAG/etc.)
                         result = await route_tool_call(tool_name, args)
 
-                        # c) send tool output back to the model (continue the response)
-                        tool_output_msg = {
-                            "type": "response.create",
-                            "response": {
-                                "input": [{
+                        # Store the function call result, but don't send yet - wait for response.done
+                        completed_function_calls.append({
+                            "call_id": call_id,
+                            "result": result
+                        })
+                        continue
+
+                    # c) response done -> now we can safely send all function outputs
+                    if response.get("type") == "response.done" and completed_function_calls:
+                        print(f"[OPENAI REALTIME] Processing {len(completed_function_calls)} function call results after response.done")
+
+                        # Send all function call outputs
+                        for func_call in completed_function_calls:
+                            function_output_item = {
+                                "type": "conversation.item.create",
+                                "item": {
                                     "type": "function_call_output",
-                                    "call_id": call_id,
-                                    "output": json.dumps(result)   # must be a string
-                                }]
+                                    "call_id": func_call["call_id"],
+                                    "output": json.dumps(func_call["result"])
+                                }
                             }
+                            print(f"[OPENAI REALTIME] Sending function call output for call_id: {func_call['call_id']}")
+                            await openai_ws.send(json.dumps(function_output_item))
+
+                        # Clear the buffer
+                        completed_function_calls.clear()
+
+                        # Create a response to continue the conversation
+                        response_create = {
+                            "type": "response.create"
                         }
-                        await openai_ws.send(json.dumps(tool_output_msg))
+                        print(f"[OPENAI REALTIME] Sending response.create to continue conversation")
+                        await openai_ws.send(json.dumps(response_create))
                         continue
                     # ---- END TOOL CALL HANDLING ----
 
@@ -232,7 +247,7 @@ async def send_initial_conversation_item(openai_ws):
             "content": [
                 {
                     "type": "input_text",
-                    "text": "Greet the user with 'Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?'"
+                    "text": "Greet the user with 'Hello there, voice agent with Ecom here! How can I help you?'"
                 }
             ]
         }
@@ -260,22 +275,7 @@ async def initialize_session(openai_ws):
                 }
             },
             "instructions": SYSTEM_MESSAGE,
-            "tools": [
-                {
-                    "type": "function",
-                    "name": "get_kb_snippets",
-                    "description": "Return short knowledge-base snippets for a company that answer a question.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "company_id": {"type": "string", "description": "Tenant/company key"},
-                            "question": {"type": "string", "description": "Natural language question"}
-                        },
-                        "required": ["company_id", "question"],
-                        "additionalProperties": False
-                    }
-                }
-            ],
+            "tools": TOOLS,
         }
     }
     print('Sending session update:', json.dumps(session_update))
@@ -286,18 +286,21 @@ async def initialize_session(openai_ws):
 
 
 arg_buffers = defaultdict(list)
+completed_function_calls = []  # Buffer for function calls waiting for response.done
 
 async def route_tool_call(name: str, args: dict):
-    # TODO: replace this with your real HTTP/RAG calls
-    if name == "get_kb_snippets":
-        # Example stub result – keep outputs concise
-        return {
-            "snippets": [
-                "Refunds are processed within 5–7 business days.",
-                "Support hours: 9–5 CET, Mon–Fri."
-            ]
-        }
-    return {"error": f"unknown tool: {name}"}
+    """Route tool calls to our function handlers."""
+    print(f"[OPENAI REALTIME] Tool call received: {name}")
+    print(f"[OPENAI REALTIME] Tool arguments: {args}")
+
+    result, error = handle_function_call(name, args)
+
+    if result is not None:
+        print(f"[OPENAI REALTIME] Tool call successful: {result}")
+        return result
+    else:
+        print(f"[OPENAI REALTIME] Tool call failed: {error}")
+        return {"error": error}
 
 if __name__ == "__main__":
     import uvicorn
