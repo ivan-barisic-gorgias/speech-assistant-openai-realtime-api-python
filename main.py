@@ -18,7 +18,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.7))
-VOICE = 'alloy'
+VOICE = 'cedar'
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',
@@ -40,11 +40,10 @@ async def index_page():
 async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
-    # <Say> punctuation to improve text-to-speech flow
-    response.say(
-        "You are connected to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API",
-        voice="Google.en-US-Chirp3-HD-Aoede"
-    )
+    # response.say(
+    #     "You are connected to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API",
+    #     voice="Google.en-US-Chirp3-HD-Aoede"
+    # )
     host = request.url.hostname
     connect = Connect()
     connect.stream(url=f'wss://{host}/media-stream')
@@ -72,6 +71,14 @@ async def handle_media_stream(websocket: WebSocket):
         mark_queue = []
         response_start_timestamp_twilio = None
         
+        # Audio buffering state for outgoing audio to Twilio
+        outgoing_audio_buffer = bytearray()
+        BUFFER_SIZE = 160  # 160 bytes per frame
+        
+        # Timing measurement for response latency
+        user_speech_stopped_time = None
+        agent_response_started_time = None
+        
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
             nonlocal stream_sid, latest_media_timestamp
@@ -91,6 +98,9 @@ async def handle_media_stream(websocket: WebSocket):
                         response_start_timestamp_twilio = None
                         latest_media_timestamp = 0
                         last_assistant_item = None
+                        # Reset timing variables for new stream
+                        user_speech_stopped_time = None
+                        agent_response_started_time = None
                     elif data['event'] == 'mark':
                         if mark_queue:
                             mark_queue.pop(0)
@@ -101,28 +111,62 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio
+            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, outgoing_audio_buffer, user_speech_stopped_time, agent_response_started_time
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
                     if response['type'] in LOG_EVENT_TYPES:
                         print(f"Received event: {response['type']}", response)
+                        
+                        # Track when user stops speaking
+                        if response['type'] == 'input_audio_buffer.speech_stopped':
+                            user_speech_stopped_time = asyncio.get_event_loop().time()
+                            print(f"[TIMING] User speech stopped at: {user_speech_stopped_time:.3f}s")
 
                     if response.get('type') == 'response.output_audio.delta' and 'delta' in response:
-                        audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
-                        audio_delta = {
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {
-                                "payload": audio_payload
+                        # Track when agent starts responding (first audio delta)
+                        if agent_response_started_time is None:
+                            agent_response_started_time = asyncio.get_event_loop().time()
+                            print(f"[TIMING] Agent response started at: {agent_response_started_time:.3f}s")
+                            
+                            # Calculate and log response latency
+                            if user_speech_stopped_time is not None:
+                                response_latency = agent_response_started_time - user_speech_stopped_time
+                                print(f"[TIMING] Response latency: {response_latency:.3f}s ({response_latency*1000:.0f}ms)")
+                            else:
+                                print(f"[TIMING] No user speech stop time recorded, cannot calculate latency")
+                        
+                        # Decode the base64 audio delta from OpenAI
+                        audio_data = base64.b64decode(response['delta'])
+                        
+                        # Add to outgoing buffer
+                        outgoing_audio_buffer.extend(audio_data)
+                        
+                        # Send complete 160-byte frames to Twilio
+                        while len(outgoing_audio_buffer) >= BUFFER_SIZE:
+                            # Extract 160 bytes from buffer
+                            frame_data = outgoing_audio_buffer[:BUFFER_SIZE]
+                            outgoing_audio_buffer = outgoing_audio_buffer[BUFFER_SIZE:]
+                            
+                            # Encode frame back to base64
+                            frame_payload = base64.b64encode(frame_data).decode('utf-8')
+                            
+                            # Send to Twilio
+                            audio_delta = {
+                                "event": "media",
+                                "streamSid": stream_sid,
+                                "media": {
+                                    "payload": frame_payload
+                                }
                             }
-                        }
-                        await websocket.send_json(audio_delta)
+                            await websocket.send_json(audio_delta)
 
 
                         if response.get("item_id") and response["item_id"] != last_assistant_item:
                             response_start_timestamp_twilio = latest_media_timestamp
                             last_assistant_item = response["item_id"]
+                            # Reset timing variables for new response
+                            agent_response_started_time = None
                             if SHOW_TIMING_MATH:
                                 print(f"Setting start timestamp for new response: {response_start_timestamp_twilio}ms")
 
@@ -163,32 +207,36 @@ async def handle_media_stream(websocket: WebSocket):
                         })
                         continue
 
-                    # c) response done -> now we can safely send all function outputs
-                    if response.get("type") == "response.done" and completed_function_calls:
-                        print(f"[OPENAI REALTIME] Processing {len(completed_function_calls)} function call results after response.done")
+                    # Handle response.done - flush audio buffer and process function calls if any
+                    if response.get("type") == "response.done":
+                        # Flush any remaining audio buffer when response is done
+                        await flush_audio_buffer()
+                        
+                        if completed_function_calls:
+                            print(f"[OPENAI REALTIME] Processing {len(completed_function_calls)} function call results after response.done")
 
-                        # Send all function call outputs
-                        for func_call in completed_function_calls:
-                            function_output_item = {
-                                "type": "conversation.item.create",
-                                "item": {
-                                    "type": "function_call_output",
-                                    "call_id": func_call["call_id"],
-                                    "output": json.dumps(func_call["result"])
+                            # Send all function call outputs
+                            for func_call in completed_function_calls:
+                                function_output_item = {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "function_call_output",
+                                        "call_id": func_call["call_id"],
+                                        "output": json.dumps(func_call["result"])
+                                    }
                                 }
+                                print(f"[OPENAI REALTIME] Sending function call output for call_id: {func_call['call_id']}")
+                                await openai_ws.send(json.dumps(function_output_item))
+
+                            # Clear the buffer
+                            completed_function_calls.clear()
+
+                            # Create a response to continue the conversation
+                            response_create = {
+                                "type": "response.create"
                             }
-                            print(f"[OPENAI REALTIME] Sending function call output for call_id: {func_call['call_id']}")
-                            await openai_ws.send(json.dumps(function_output_item))
-
-                        # Clear the buffer
-                        completed_function_calls.clear()
-
-                        # Create a response to continue the conversation
-                        response_create = {
-                            "type": "response.create"
-                        }
-                        print(f"[OPENAI REALTIME] Sending response.create to continue conversation")
-                        await openai_ws.send(json.dumps(response_create))
+                            print(f"[OPENAI REALTIME] Sending response.create to continue conversation")
+                            await openai_ws.send(json.dumps(response_create))
                         continue
                     # ---- END TOOL CALL HANDLING ----
 
@@ -197,8 +245,16 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def handle_speech_started_event():
             """Handle interruption when the caller's speech starts."""
-            nonlocal response_start_timestamp_twilio, last_assistant_item
+            nonlocal response_start_timestamp_twilio, last_assistant_item, outgoing_audio_buffer, user_speech_stopped_time, agent_response_started_time
             print("Handling speech started event.")
+            
+            # Reset timing variables on interruption
+            user_speech_stopped_time = None
+            agent_response_started_time = None
+            
+            # Flush any remaining audio buffer before interruption
+            await flush_audio_buffer()
+            
             if mark_queue and response_start_timestamp_twilio is not None:
                 elapsed_time = latest_media_timestamp - response_start_timestamp_twilio
                 if SHOW_TIMING_MATH:
@@ -224,6 +280,24 @@ async def handle_media_stream(websocket: WebSocket):
                 mark_queue.clear()
                 last_assistant_item = None
                 response_start_timestamp_twilio = None
+                # Clear the audio buffer on interruption
+                outgoing_audio_buffer = bytearray()
+
+        async def flush_audio_buffer():
+            """Flush any remaining audio buffer to Twilio."""
+            nonlocal outgoing_audio_buffer
+            if outgoing_audio_buffer and stream_sid:
+                # Send remaining audio data as-is (no padding to avoid audio pops)
+                frame_payload = base64.b64encode(outgoing_audio_buffer).decode('utf-8')
+                audio_delta = {
+                    "event": "media",
+                    "streamSid": stream_sid,
+                    "media": {
+                        "payload": frame_payload
+                    }
+                }
+                await websocket.send_json(audio_delta)
+                outgoing_audio_buffer = bytearray()
 
         async def send_mark(connection, stream_sid):
             if stream_sid:
@@ -247,7 +321,7 @@ async def send_initial_conversation_item(openai_ws):
             "content": [
                 {
                     "type": "input_text",
-                    "text": "Greet the user with 'Hello there, voice agent with Ecom here! How can I help you?'"
+                    "text": "Greet the user with 'Hello! Welcome to our voice assistant. How can I help you today?'"
                 }
             ]
         }
@@ -267,7 +341,19 @@ async def initialize_session(openai_ws):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},
-                    "turn_detection": { "type": "semantic_vad", "create_response": True }
+                    # "turn_detection": { 
+                    #     "type": "semantic_vad", 
+                    #     "create_response": True,
+                    #     "eagerness": "auto"
+                    # }
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 200,
+                        "silence_duration_ms": 200,
+                        "create_response": True,
+                        "interrupt_response": True
+                    }
                 },
                 "output": {
                     "format": {"type": "audio/pcmu"},
@@ -282,7 +368,7 @@ async def initialize_session(openai_ws):
     await openai_ws.send(json.dumps(session_update))
 
     # Uncomment the next line to have the AI speak first
-    # await send_initial_conversation_item(openai_ws)
+    await send_initial_conversation_item(openai_ws)
 
 
 arg_buffers = defaultdict(list)
